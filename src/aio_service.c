@@ -22,6 +22,28 @@
 #define errorExit(msg) \
            do { perror(msg); exit(EXIT_FAILURE); } while (0)
 
+typedef struct AIO_PARAMETERS{
+	unsigned aioQueueCapacity;
+	unsigned io_event_wait_min_num;
+	struct timespec timeout_io_get_event; //The waiting time of a call to io_getevent
+	struct itimerspec io_delay; //the longest delay before submitting iocbs array
+
+	unsigned RUNFLAG;
+
+	aio_context_t ctx;
+	int efd_iocbs_ind_access; // eventfd for iocbs array
+	int efd_iocbs_left; //eventfd for iocbs array capacity left
+	int efd_iocbs_added; //eventfd for iocbs array added num
+
+	int tfd_iocbs_sumbit; //timerfd for iocbs batch submit
+	struct iocb* iocbs;
+	int iocbs_end_index;
+	EventProc * eventProc;
+	struct io_event *eventsQueue;
+
+	pthread_t pt[3];
+	int efd_signal;
+}Aio_parameters;
 
 static inline void io_batch_submit(Aio_parameters* aiop) {
 	uint64_t u=0;
@@ -64,7 +86,14 @@ static int aio_batch_submit(Aio_parameters* aiop){
 }
 
 
-static inline int aio_parameters_init(Aio_parameters * aiop){
+static Aio_parameters* aio_parameters_init(const Aio_param * const ap){
+
+	Aio_parameters * aiop=malloc(sizeof(Aio_parameters));
+	aiop->aioQueueCapacity=ap->aioQueueCapacity;
+	aiop->io_event_wait_min_num=ap->io_event_wait_min_num;
+	aiop->io_delay=ap->io_delay;
+	aiop->timeout_io_get_event=ap->timeout_io_get_event;
+
 	int n=aiop->aioQueueCapacity;
 	aiop->eventProc=malloc(n*sizeof(EventProc));
 	aiop->eventsQueue=malloc(n*sizeof(struct io_event));
@@ -73,38 +102,38 @@ static inline int aio_parameters_init(Aio_parameters * aiop){
 
 	//init efd for iocbs
 	if (-1==(aiop->efd_iocbs_ind_access=eventfd(1,0))){
-		perror("aiop->efd_iocbs_ind_access create failed:\n"); return -1;
+		perror("aiop->efd_iocbs_ind_access create failed:\n"); free(aiop);return NULL;
 	}
 
 	if (-1==(aiop->efd_iocbs_left=eventfd(aiop->aioQueueCapacity,EFD_SEMAPHORE))){
-		perror("aiop->efd_iocbs_left create failed:\n"); return -1;
+		perror("aiop->efd_iocbs_left create failed:\n"); free(aiop);return NULL;
 	}
 
 	if (-1==(aiop->efd_iocbs_added=eventfd(0,EFD_SEMAPHORE))){
-		perror("aiop->efd_iocbs_added create failed:\n"); return -1;
+		perror("aiop->efd_iocbs_added create failed:\n"); free(aiop);return NULL;
 	}else
 		eventfd_write(aiop->efd_iocbs_added,0xfffffffffffffffe);
 
 	//Create timerfd
 	if(-1==(aiop->tfd_iocbs_sumbit=timerfd_create(CLOCK_MONOTONIC, 0))){
-		perror("aiop->tfd_iocbs_sumbit create failed:\n"); return -1;
+		perror("aiop->tfd_iocbs_sumbit create failed:\n"); free(aiop);return NULL;
 	}
 	if(-1==(aiop->efd_signal=eventfd(0,EFD_SEMAPHORE))){
-			perror("aiop->efd_signal create failed:\n"); return -1;
+			perror("aiop->efd_signal create failed:\n"); free(aiop);return NULL;
 	}
 
 	//init aio ctx
 	memset(&(aiop->ctx),0, sizeof(aio_context_t));  // It's necessary
 	/*Syscall IO_setup*/
 	if (-1==syscall(SYS_io_setup, aiop->aioQueueCapacity, &(aiop->ctx))){
-		perror("SYS_io_setup failed:\n"); return -1;
+		perror("SYS_io_setup failed:\n"); free(aiop);return NULL;
 	}
 printf("aio parm inited.\n");
 	aiop->RUNFLAG=1;
-	return 0;
+	return aiop;
 }
 
-static inline int aio_parameters_destroy(Aio_parameters * aiop){
+static int aio_parameters_destroy(Aio_parameters * aiop){
 	int ret=0;
 	if(-1==syscall(SYS_io_destroy,aiop->ctx)){
 		perror("failure to destroy aiop->ctx:\n"); ret= -1;
@@ -119,13 +148,14 @@ static inline int aio_parameters_destroy(Aio_parameters * aiop){
 		perror("failure to close aiop->efd_iocbs_left:\n"); ret= -1;
 	}
 	if(-1==close(aiop->tfd_iocbs_sumbit)){
-		perror("failure to close aiop->tfd_iocbs_sumbit:\n");
-		return -1;
+		perror("failure to close aiop->tfd_iocbs_sumbit:\n");ret= -1;
 	}
 
 	free(aiop->eventProc);
 	free(aiop->eventsQueue);
 	free(aiop->iocbs);
+
+	free(aiop);
 
 	printf("aio_parameters_destroy finished.\n");
 	return ret;
@@ -155,20 +185,17 @@ static int get_io_event(Aio_parameters * aiop){
 		return 0;
 }
 
-int aio_service(Aio_parameters * aiop){
-	if(-1==aio_parameters_init(aiop))
-		return -1;
-
+static int aio_service(Aio_parameters * aiop){
 	//开辟一个线程, 用于批量提交iocbs array中的io请求.
 	//create a thread for io_batch_submit(aiop);
-	pthread_t* tid_aio_batch_submit=&(aiop->pt[0]);
+	pthread_t* tid_aio_batch_submit=&(aiop->pt[1]);
 	int err = pthread_create(tid_aio_batch_submit, NULL, (void *(*) (void *))aio_batch_submit, aiop);
 	if (err != 0) {
 		fprintf(stderr, "can't create thread aio_batch_submit: %s\n", strerror(err));
 		return -1;
 	}
 
-	pthread_t* tid_get_io_event=&(aiop->pt[1]);
+	pthread_t* tid_get_io_event=&(aiop->pt[2]);
 	err = pthread_create(tid_get_io_event, NULL, (void *(*) (void *))get_io_event, aiop);
 	if (err != 0) {
 		fprintf(stderr, "can't create thread get_io_event: %s\n", strerror(err));
@@ -176,7 +203,7 @@ int aio_service(Aio_parameters * aiop){
 	}
 
 	//wait stop signal
-	uint64_t n;
+	uint64_t n=0;
 	while(0<eventfd_read(aiop->efd_signal,&n)){
 		if(n>0)
 			break;
@@ -185,7 +212,7 @@ int aio_service(Aio_parameters * aiop){
 	// stop service
 	aiop->RUNFLAG=0;
 	void* thread_return;
-	for(int i=sizeof(aiop->pt);i<0;--i){
+	for(int i=sizeof(aiop->pt)-1;i>0;--i){
 		printf("cancel thread %d ; result: %d\n",i,pthread_cancel(aiop->pt[i]));
 		printf("join thread %d ; result: %d\n",i,pthread_join(aiop->pt[i],&thread_return));
 		printf("%d\n",(int)thread_return);
@@ -195,14 +222,41 @@ int aio_service(Aio_parameters * aiop){
 
 	return 0;
 }
+/*
+ * thread_band_cpu_num : array
+ */
+const char* aio_service_start(const Aio_param * const ap,cpu_set_t* cpuset) {
+	Aio_parameters* aiop=aio_parameters_init(ap);
+	if(NULL==aiop)	{perror("aiop init failed!.\n");return NULL;}
 
-int aio_service_stop(Aio_parameters * aiop){
-	eventfd_write(aiop->efd_signal,1);
+	pthread_t th_aio_service;
+	pthread_attr_t attr,*attrp=NULL;
+	pthread_attr_init(&attr);
+	if(cpuset!=NULL){
+		pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+		pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), cpuset); //绑定逻辑核心
+		attrp = &attr;
+	}
+	if (-1== pthread_create(&th_aio_service, attrp,	(void *(*)(void *)) aio_service, aiop))
+		perror("pthread_create(th_aio_service, &attr, (void *(*) (void *))aio_service_start, aiop).");
+	else
+		printf("aio_service_started.\n");
+
+	pthread_attr_destroy(&attr);
+
+	return (const char*)aiop;
+}
+
+int aio_service_stop(const char * const aiop){
+	Aio_parameters* p=(Aio_parameters*)aiop;
+	eventfd_write(p->efd_signal,1);
+	pthread_join(p->pt[0],NULL);
 	return 0;
 }
 
 //外部接口,用于用户提交io请求
-int submit_io_task(Aio_parameters* aiop,int fd, unsigned io_cmd, void* data, void(*callback)(void*),__u64 buf,__s64 offset){
+int submit_io_task(char* aps,int fd, unsigned io_cmd, void* data, void(*callback)(void*),__u64 buf,__s64 offset){
+	Aio_parameters * const aiop=(Aio_parameters*)aps;
 	if(!aiop->RUNFLAG){ printf("AIO service is not running!");return -1;}
 
 	uint64_t n=0;
