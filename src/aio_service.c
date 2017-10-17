@@ -41,13 +41,14 @@ typedef struct AIO_PARAMETERS{
 	int iocbs_end_index;
 	EventProc * eventProc;
 	struct io_event *eventsQueue;
+	void *(*on_io_complete) (struct io_event *,int n); //how to deal the eventsQueue exported by io_getevents
 
 	pthread_t pt[3];
-	int efd_signal;
+	int efd_signal_stop_srv;
 }Aio_parameters;
 
 static inline void io_batch_submit(Aio_parameters* aiop) {
-	uint64_t u=0;
+	eventfd_t u=0;
 	//临界区开始
 	eventfd_read(aiop->efd_iocbs_ind_access,&u);
 	if(aiop->iocbs_end_index>0){
@@ -58,9 +59,9 @@ static inline void io_batch_submit(Aio_parameters* aiop) {
 			char s[100];
 			sprintf(s,"syscall(SYS_io_submit,%lu, %d, %x).",aiop->ctx,aiop->iocbs_end_index,(unsigned int)(aiop->iocbs));
 			perror(s);
-			exit(EXIT_FAILURE);
+			eventfd_write(aiop->efd_signal_stop_srv,1);
 		}
-
+//TODO if io_submit failed or submit num < iocbs_end_index
 		eventfd_write(aiop->efd_iocbs_left,aiop->iocbs_end_index);
 		aiop->iocbs_end_index=0;
 	}
@@ -94,6 +95,7 @@ static Aio_parameters* aio_parameters_init(const Aio_param * const ap){
 	aiop->io_event_wait_min_num=ap->io_event_wait_min_num;
 	aiop->io_delay=ap->io_delay;
 	aiop->timeout_io_get_event=ap->timeout_io_get_event;
+	aiop->on_io_complete=ap->on_io_complete;
 
 	int n=aiop->aioQueueCapacity;
 	aiop->eventProc=malloc(n*sizeof(EventProc));
@@ -119,7 +121,7 @@ static Aio_parameters* aio_parameters_init(const Aio_param * const ap){
 	if(-1==(aiop->tfd_iocbs_sumbit=timerfd_create(CLOCK_MONOTONIC, 0))){
 		perror("aiop->tfd_iocbs_sumbit create failed:\n"); free(aiop);return NULL;
 	}
-	if(-1==(aiop->efd_signal=eventfd(0,EFD_SEMAPHORE))){
+	if(-1==(aiop->efd_signal_stop_srv=eventfd(0,EFD_SEMAPHORE))){
 			perror("aiop->efd_signal create failed:\n"); free(aiop);return NULL;
 	}
 
@@ -151,7 +153,7 @@ static int aio_parameters_destroy(Aio_parameters * aiop){
 	if(-1==close(aiop->tfd_iocbs_sumbit)){
 		perror("failure to close aiop->tfd_iocbs_sumbit:\n");ret= -1;
 	}
-	if(-1==close(aiop->efd_signal)){
+	if(-1==close(aiop->efd_signal_stop_srv)){
 		perror("failure to close aiop->efd_signal:\n");ret= -1;
 	}
 
@@ -166,8 +168,7 @@ static int aio_parameters_destroy(Aio_parameters * aiop){
 }
 
 static void sighandler_getIoEvent(int x){
-	pthread_t pt=pthread_self();
-	printf("cancel thread %lu ; result: %d\n",pt,pthread_cancel(pt));
+	printf("cancel thread getIoEvent. result: %d\n",pthread_cancel(pthread_self()));
 }
 static int get_io_event(Aio_parameters * aiop) {
 	//register signal for interrupt io_getevent
@@ -177,22 +178,24 @@ static int get_io_event(Aio_parameters * aiop) {
 	unsigned min = aiop->io_event_wait_min_num, max = aiop->aioQueueCapacity;
 	struct timespec *timeout = &(aiop->timeout_io_get_event);
 	do {
-		//NOTE:can not cancel by pthread_cancel()
+		//NOTE:can not wake up io_getevents from block with pthread_cancel(), must send signal (such as SIGIO etc.)
 		n = syscall(SYS_io_getevents, aiop->ctx, min, max, aiop->eventsQueue,
 				timeout);
-		if (-1 == n) {
-			perror("SYS_io_getevents failed.\n");
-//			return -1;
-		} else if (n < 1) {
+		printf("io_event get:%d\n", n);
+		if(n>0){
+			//deal with io_event array exported by io_getevents
+			aiop->on_io_complete(aiop->eventsQueue,n);
+			if(min == 1){
+				min = aiop->io_event_wait_min_num;
+				timeout = &(aiop->timeout_io_get_event);
+			}
+		}else if(n<1){
 			timeout = NULL;
 			min = 1;
-		} else if (min == 1) {
-			min = aiop->io_event_wait_min_num;
-			timeout = &(aiop->timeout_io_get_event);
+		}else if(-1==n){
+			perror("SYS_io_getevents failed.\n");
 		}
-		//分派接收到的完成事件
-		//TODO dispatch
-		printf("io_event get:%d\n", n);
+
 	} while (1);
 
 	return 0;
@@ -218,7 +221,7 @@ static int aio_service(Aio_parameters * aiop){
 	//wait stop signal
 	eventfd_t n=0;
 	while(1){
-		int x=eventfd_read(aiop->efd_signal,&n);
+		int x=eventfd_read(aiop->efd_signal_stop_srv,&n);
 		if(x==0)
 			break;
 		else{
@@ -231,14 +234,17 @@ static int aio_service(Aio_parameters * aiop){
 	aiop->RUNFLAG=0;
 	void* thread_return;
 
+	/*
+	 * send signal to thread get_io_event to interrupt io_getevent,
+	 * then cancel thread itself with a signal Handler predefined
+	 */
 	printf("kill thread %lu ; result: %d\n",*tid_get_io_event,pthread_kill(*tid_get_io_event,SIGIO));
-//	printf("kill thread %lu ; result: %d\n",*tid_get_io_event,pthread_cancel(*tid_get_io_event));
-
 	printf("join thread %lu ; result: %d\n",*tid_get_io_event,pthread_join(*tid_get_io_event,&thread_return));
+
 	sleep(3);
+
 	printf("cancel thread %lu ; result: %d\n",*tid_aio_batch_submit,pthread_cancel(*tid_aio_batch_submit));
 	printf("join thread %lu ; result: %d\n",*tid_aio_batch_submit,pthread_join(*tid_aio_batch_submit,&thread_return));
-
 
 	printf("aio service has stopped!\n");
 	return 0;
@@ -270,7 +276,7 @@ const char* aio_service_start(const Aio_param * const ap,cpu_set_t* cpuset) {
 
 int aio_service_stop(const char * const aiop){
 	Aio_parameters* p=(Aio_parameters*)aiop;
-	eventfd_write(p->efd_signal,1);
+	eventfd_write(p->efd_signal_stop_srv,1);
 	pthread_join(p->pt[0],NULL);
 	aio_parameters_destroy(p);
 	return 0;

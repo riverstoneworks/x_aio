@@ -23,6 +23,10 @@
 #define handle_error_en(en, msg) \
                do { errno = en; perror(msg); exit(EXIT_FAILURE); } while (0)
 
+void *on_io_complete (struct io_event * ie,int n){
+	return (void*)0;
+}
+
 int main(int argc, char *argv[]) {
 	Aio_param ap;
 	ap.aioQueueCapacity=10;
@@ -31,6 +35,7 @@ int main(int argc, char *argv[]) {
 	memset(&(ap.io_delay),0,sizeof(ap.io_delay));
 	ap.io_delay.it_interval.tv_nsec=1000000;
 	ap.timeout_io_get_event.tv_nsec=2000000;
+	ap.on_io_complete=on_io_complete;
 
 	const char* const aiop=aio_service_start(&ap,NULL);
 
