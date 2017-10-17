@@ -34,7 +34,9 @@ int main(int argc, char *argv[]) {
 
 	const char* const aiop=aio_service_start(&ap,NULL);
 
-	sleep(10);
-	aio_service_stop(&aiop);
+	sleep(3);
+	aio_service_stop(aiop);
+	sleep(3);
+
 	exit(EXIT_SUCCESS);
 }

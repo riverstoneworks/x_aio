@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 #include <pthread.h>
 #include <sys/timerfd.h>
 #include <sys/syscall.h>
@@ -150,6 +151,9 @@ static int aio_parameters_destroy(Aio_parameters * aiop){
 	if(-1==close(aiop->tfd_iocbs_sumbit)){
 		perror("failure to close aiop->tfd_iocbs_sumbit:\n");ret= -1;
 	}
+	if(-1==close(aiop->efd_signal)){
+		perror("failure to close aiop->efd_signal:\n");ret= -1;
+	}
 
 	free(aiop->eventProc);
 	free(aiop->eventsQueue);
@@ -161,28 +165,37 @@ static int aio_parameters_destroy(Aio_parameters * aiop){
 	return ret;
 }
 
-static int get_io_event(Aio_parameters * aiop){
+static void sighandler_getIoEvent(int x){
+	pthread_t pt=pthread_self();
+	printf("cancel thread %lu ; result: %d\n",pt,pthread_cancel(pt));
+}
+static int get_io_event(Aio_parameters * aiop) {
+	//register signal for interrupt io_getevent
+	signal(SIGIO,(__sighandler_t)sighandler_getIoEvent);
 	//get_event
-		int n=0;
-		unsigned min=aiop->io_event_wait_min_num, max=aiop->aioQueueCapacity;
-		struct timespec *timeout=&(aiop->timeout_io_get_event);
-		do{
-			n=syscall(SYS_io_getevents,aiop->ctx, min, max, aiop->eventsQueue, timeout);
-		    if(-1==n){
-		    	perror("SYS_io_getevents failed."); return -1;
-		    }else if(n<1){
-		    	timeout=NULL;
-		    	min=1;
-		    }else if(min==1){
-		    	min=aiop->io_event_wait_min_num;
-		    	timeout=&(aiop->timeout_io_get_event);
-		    }
-		    //分派接收到的完成事件
-		    //TODO dispatch
-		    printf("io_event get:%d\n",n);
-		}while(aiop->RUNFLAG);
+	int n = 0;
+	unsigned min = aiop->io_event_wait_min_num, max = aiop->aioQueueCapacity;
+	struct timespec *timeout = &(aiop->timeout_io_get_event);
+	do {
+		//NOTE:can not cancel by pthread_cancel()
+		n = syscall(SYS_io_getevents, aiop->ctx, min, max, aiop->eventsQueue,
+				timeout);
+		if (-1 == n) {
+			perror("SYS_io_getevents failed.\n");
+//			return -1;
+		} else if (n < 1) {
+			timeout = NULL;
+			min = 1;
+		} else if (min == 1) {
+			min = aiop->io_event_wait_min_num;
+			timeout = &(aiop->timeout_io_get_event);
+		}
+		//分派接收到的完成事件
+		//TODO dispatch
+		printf("io_event get:%d\n", n);
+	} while (1);
 
-		return 0;
+	return 0;
 }
 
 static int aio_service(Aio_parameters * aiop){
@@ -203,23 +216,31 @@ static int aio_service(Aio_parameters * aiop){
 	}
 
 	//wait stop signal
-	uint64_t n=0;
-	while(0<eventfd_read(aiop->efd_signal,&n)){
-		if(n>0)
+	eventfd_t n=0;
+	while(1){
+		int x=eventfd_read(aiop->efd_signal,&n);
+		if(x==0)
 			break;
+		else{
+			perror("eventfd_read(aiop->efd_signal,&n)\n");
+			break;
+		}
 	}
 
 	// stop service
 	aiop->RUNFLAG=0;
 	void* thread_return;
-	for(int i=sizeof(aiop->pt)-1;i>0;--i){
-		printf("cancel thread %d ; result: %d\n",i,pthread_cancel(aiop->pt[i]));
-		printf("join thread %d ; result: %d\n",i,pthread_join(aiop->pt[i],&thread_return));
-		printf("%d\n",(int)thread_return);
-	}
-	aio_parameters_destroy(aiop);
-	printf("aio service has stopped!\n");
 
+	printf("kill thread %lu ; result: %d\n",*tid_get_io_event,pthread_kill(*tid_get_io_event,SIGIO));
+//	printf("kill thread %lu ; result: %d\n",*tid_get_io_event,pthread_cancel(*tid_get_io_event));
+
+	printf("join thread %lu ; result: %d\n",*tid_get_io_event,pthread_join(*tid_get_io_event,&thread_return));
+	sleep(3);
+	printf("cancel thread %lu ; result: %d\n",*tid_aio_batch_submit,pthread_cancel(*tid_aio_batch_submit));
+	printf("join thread %lu ; result: %d\n",*tid_aio_batch_submit,pthread_join(*tid_aio_batch_submit,&thread_return));
+
+
+	printf("aio service has stopped!\n");
 	return 0;
 }
 /*
@@ -229,7 +250,7 @@ const char* aio_service_start(const Aio_param * const ap,cpu_set_t* cpuset) {
 	Aio_parameters* aiop=aio_parameters_init(ap);
 	if(NULL==aiop)	{perror("aiop init failed!.\n");return NULL;}
 
-	pthread_t th_aio_service;
+	pthread_t *th_aio_service=&aiop->pt[0];
 	pthread_attr_t attr,*attrp=NULL;
 	pthread_attr_init(&attr);
 	if(cpuset!=NULL){
@@ -237,7 +258,7 @@ const char* aio_service_start(const Aio_param * const ap,cpu_set_t* cpuset) {
 		pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), cpuset); //绑定逻辑核心
 		attrp = &attr;
 	}
-	if (-1== pthread_create(&th_aio_service, attrp,	(void *(*)(void *)) aio_service, aiop))
+	if (-1== pthread_create(th_aio_service, attrp,	(void *(*)(void *)) aio_service, aiop))
 		perror("pthread_create(th_aio_service, &attr, (void *(*) (void *))aio_service_start, aiop).");
 	else
 		printf("aio_service_started.\n");
@@ -251,6 +272,7 @@ int aio_service_stop(const char * const aiop){
 	Aio_parameters* p=(Aio_parameters*)aiop;
 	eventfd_write(p->efd_signal,1);
 	pthread_join(p->pt[0],NULL);
+	aio_parameters_destroy(p);
 	return 0;
 }
 
