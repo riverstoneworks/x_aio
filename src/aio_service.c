@@ -54,14 +54,17 @@ static inline void io_batch_submit(Aio_parameters* aiop) {
 	if(aiop->iocbs_end_index>0){
 		//等待已经获得席位的iocbs装入提交队列.
 		eventfd_write(aiop->efd_iocbs_added,aiop->iocbs_end_index);
-
-		if(-1==syscall(SYS_io_submit,aiop->ctx, aiop->iocbs_end_index, aiop->iocbs)){
-			char s[100];
-			sprintf(s,"syscall(SYS_io_submit,%lu, %d, %x).",aiop->ctx,aiop->iocbs_end_index,(unsigned int)(aiop->iocbs));
-			perror(s);
-			eventfd_write(aiop->efd_signal_stop_srv,1);
+		//if io_submit failed or submit num < iocbs_end_index
+		for(int m=aiop->iocbs_end_index,n=0;m>0;m-=n){
+			if(1>(n=syscall(SYS_io_submit,aiop->ctx, m, aiop->iocbs+n))){
+				char s[100];
+				sprintf(s,"syscall(SYS_io_submit,%lu, %d, %x).",aiop->ctx,aiop->iocbs_end_index,(unsigned int)(aiop->iocbs));
+				perror(s);
+				eventfd_write(aiop->efd_signal_stop_srv,1);
+				return ;
+			}
+			printf("batch submit %d, left %d\n",n,m-n);
 		}
-//TODO if io_submit failed or submit num < iocbs_end_index
 		eventfd_write(aiop->efd_iocbs_left,aiop->iocbs_end_index);
 		aiop->iocbs_end_index=0;
 	}

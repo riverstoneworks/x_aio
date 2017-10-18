@@ -2,7 +2,7 @@
  * test.c
  *
  *  Created on: Oct 15, 2017
- *      Author: xpc
+ *      Author: Like.Z
  */
 
 
@@ -28,19 +28,20 @@ void *on_io_complete (struct io_event * ie,int n){
 }
 
 int main(int argc, char *argv[]) {
-	Aio_param ap;
-	ap.aioQueueCapacity=10;
-	ap.io_event_wait_min_num=5;
-	memset(&(ap.timeout_io_get_event),0,sizeof(ap.timeout_io_get_event));
-	memset(&(ap.io_delay),0,sizeof(ap.io_delay));
-	ap.io_delay.it_interval.tv_nsec=1000000;
-	ap.timeout_io_get_event.tv_nsec=2000000;
-	ap.on_io_complete=on_io_complete;
+	Aio_param ap={
+			.aioQueueCapacity=10,
+			.io_event_wait_min_num=5,
+			.io_delay={{0,1000000},{0,0}},
+			.timeout_io_get_event={0,2000000},
+			.on_io_complete=on_io_complete
+	};
 
 	const char* const aiop=aio_service_start(&ap,NULL);
 
 	sleep(3);
+
 	aio_service_stop(aiop);
+
 	sleep(3);
 
 	exit(EXIT_SUCCESS);
