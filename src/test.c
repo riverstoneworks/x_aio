@@ -36,7 +36,7 @@ int main(int argc, char *argv[]) {
 			.on_io_complete=on_io_complete
 	};
 
-	const char* const aiop=aio_service_start(&ap,NULL);
+	const char* const aiop=aio_service_start(ap,NULL);
 
 	sleep(3);
 

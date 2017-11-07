@@ -24,10 +24,11 @@
            do { perror(msg); exit(EXIT_FAILURE); } while (0)
 
 typedef struct AIO_PARAMETERS{
-	unsigned aioQueueCapacity;
-	unsigned io_event_wait_min_num;
-	struct timespec timeout_io_get_event; //The waiting time of a call to io_getevent
-	struct itimerspec io_delay; //the longest delay before submitting iocbs array
+	Aio_param apm;
+//	unsigned aioQueueCapacity;
+//	unsigned io_event_wait_min_num;
+//	struct timespec timeout_io_get_event; //The waiting time of a call to io_getevent
+//	struct itimerspec io_delay; //the longest delay before submitting iocbs array
 
 	unsigned RUNFLAG;
 
@@ -41,7 +42,7 @@ typedef struct AIO_PARAMETERS{
 	int iocbs_end_index;
 	EventProc * eventProc;
 	struct io_event *eventsQueue;
-	void *(*on_io_complete) (struct io_event *,int n); //how to deal the eventsQueue exported by io_getevents
+//	void *(*on_io_complete) (struct io_event *,int n); //how to deal the eventsQueue exported by io_getevents
 
 	pthread_t pt[3];
 	int efd_signal_stop_srv;
@@ -91,16 +92,17 @@ static int aio_batch_submit(Aio_parameters* aiop){
 }
 
 
-static Aio_parameters* aio_parameters_init(const Aio_param * const ap){
+static Aio_parameters* aio_parameters_init(const Aio_param ap){
 
 	Aio_parameters * aiop=malloc(sizeof(Aio_parameters));
-	aiop->aioQueueCapacity=ap->aioQueueCapacity;
-	aiop->io_event_wait_min_num=ap->io_event_wait_min_num;
-	aiop->io_delay=ap->io_delay;
-	aiop->timeout_io_get_event=ap->timeout_io_get_event;
-	aiop->on_io_complete=ap->on_io_complete;
+	aiop->apm=ap;
+//	aiop->aioQueueCapacity=ap->aioQueueCapacity;
+//	aiop->io_event_wait_min_num=ap->io_event_wait_min_num;
+//	aiop->io_delay=ap->io_delay;
+//	aiop->timeout_io_get_event=ap->timeout_io_get_event;
+//	aiop->on_io_complete=ap->on_io_complete;
 
-	int n=aiop->aioQueueCapacity;
+	int n=aiop->apm.aioQueueCapacity;
 	aiop->eventProc=malloc(n*sizeof(EventProc));
 	aiop->eventsQueue=malloc(n*sizeof(struct io_event));
 	aiop->iocbs=malloc(n*sizeof(struct iocb));
@@ -111,7 +113,7 @@ static Aio_parameters* aio_parameters_init(const Aio_param * const ap){
 		perror("aiop->efd_iocbs_ind_access create failed:\n"); free(aiop);return NULL;
 	}
 
-	if (-1==(aiop->efd_iocbs_left=eventfd(aiop->aioQueueCapacity,EFD_SEMAPHORE))){
+	if (-1==(aiop->efd_iocbs_left=eventfd(aiop->apm.aioQueueCapacity,EFD_SEMAPHORE))){
 		perror("aiop->efd_iocbs_left create failed:\n"); free(aiop);return NULL;
 	}
 
@@ -131,7 +133,7 @@ static Aio_parameters* aio_parameters_init(const Aio_param * const ap){
 	//init aio ctx
 	memset(&(aiop->ctx),0, sizeof(aio_context_t));  // It's necessary
 	/*Syscall IO_setup*/
-	if (-1==syscall(SYS_io_setup, aiop->aioQueueCapacity, &(aiop->ctx))){
+	if (-1==syscall(SYS_io_setup, aiop->apm.aioQueueCapacity, &(aiop->ctx))){
 		perror("SYS_io_setup failed:\n"); free(aiop);return NULL;
 	}
 printf("aio parm inited.\n");
@@ -178,8 +180,8 @@ static int get_io_event(Aio_parameters * aiop) {
 	signal(SIGIO,(__sighandler_t)sighandler_getIoEvent);
 	//get_event
 	int n = 0;
-	unsigned min = aiop->io_event_wait_min_num, max = aiop->aioQueueCapacity;
-	struct timespec *timeout = &(aiop->timeout_io_get_event);
+	unsigned min = aiop->apm.io_event_wait_min_num, max = aiop->apm.aioQueueCapacity;
+	struct timespec *timeout = &(aiop->apm.timeout_io_get_event);
 	do {
 		//NOTE:can not wake up io_getevents from block with pthread_cancel(), must send signal (such as SIGIO etc.)
 		n = syscall(SYS_io_getevents, aiop->ctx, min, max, aiop->eventsQueue,
@@ -187,10 +189,10 @@ static int get_io_event(Aio_parameters * aiop) {
 		printf("io_event get:%d\n", n);
 		if(n>0){
 			//deal with io_event array exported by io_getevents
-			aiop->on_io_complete(aiop->eventsQueue,n);
+			aiop->apm.on_io_complete(aiop->eventsQueue,n);
 			if(min == 1){
-				min = aiop->io_event_wait_min_num;
-				timeout = &(aiop->timeout_io_get_event);
+				min = aiop->apm.io_event_wait_min_num;
+				timeout = &(aiop->apm.timeout_io_get_event);
 			}
 		}else if(n<1){
 			timeout = NULL;
@@ -255,7 +257,7 @@ static int aio_service(Aio_parameters * aiop){
 /*
  * thread_band_cpu_num : array
  */
-const char* aio_service_start(const Aio_param * const ap,cpu_set_t* cpuset) {
+const char* aio_service_start(const Aio_param ap,cpu_set_t* cpuset) {
 	Aio_parameters* aiop=aio_parameters_init(ap);
 	if(NULL==aiop)	{perror("aiop init failed!.\n");return NULL;}
 
@@ -324,14 +326,14 @@ int submit_io_task(char* aps,int fd, unsigned io_cmd, void* data, void(*callback
 		return -1||printf("Failed read efd");
 
 	//若待提交队列已满 修改timer, 立即唤醒线程io_batch_submit
-	if(ind==aiop->aioQueueCapacity){
+	if(ind==aiop->apm.aioQueueCapacity){
 		struct itimerspec z;
 		memset(&z,0,sizeof(struct itimerspec));
 		z.it_value.tv_nsec=1;
 		timerfd_settime(aiop->tfd_iocbs_sumbit,0,&z,NULL);
 	}else if(ind==1){
 		//队列中加入第一个请求,启动定时器
-		timerfd_settime(aiop->tfd_iocbs_sumbit,0,&(aiop->io_delay),NULL);
+		timerfd_settime(aiop->tfd_iocbs_sumbit,0,&(aiop->apm.io_delay),NULL);
 	}
 	return 0;
 }
